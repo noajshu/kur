@@ -86,6 +86,7 @@ container looks like this:
 	  oldest: OLDEST
 	  inputs: INPUTS
 	  sink: SINK
+	  freeze: FREEZE
 
 There are many different kinds of containers, which we describe on the
 :doc:`containers` page. The parameters that are given to the container (e.g.,
@@ -318,6 +319,43 @@ so it still gets its input from the most recently declared container.) And if
 output named ``layer_2``.
 
 .. _template_spec:
+
+Freeze
+------
+
+The ``freeze`` value indicates whether or not this container's weights (if any)
+should be modified during the training process. Setting this to False will
+allow the layer to be trained during the backpropagation phase of training.
+Similarly, setting this to True will lock the container's weights during
+training. If it is unset, the value is inherited from the container's parent.
+If no parent containers have a set value of ``freeze``, it will default to
+False.
+
+This makes it very easy to configure trainable aspects of your model. Even
+though not all containers have weights associated with them, you can mark
+parent containers as trainable (or not), and you will get trickle-down effects
+that you can override. For example:
+
+.. code-block:: yaml
+
+	- for:
+	    range: 10
+	    iterate:
+	      - dense: 10
+	      - dense: 20
+	        freeze: false
+	      - dense: 30
+	  freeze: yes
+
+In this example, the ``dense: 10`` layer in the ``for`` loop has frozen
+(untrainable) weights. This is because ``freeze`` was not explicitly specified
+for that layer, and so it inherits the "frozen-ness" of its parent (the ``for``
+loop), which is frozen. This is the same for the ``dense: 30`` layer. In
+contrast, the ``dense: 20`` layer overrides its parent's ``freeze`` value,
+allowing its parameters to vary during training. If the ``for`` loop did *not*
+have a ``freeze`` value specified, then all three ``dense`` layers would be
+trainable (not frozen), because they would inherit the global default of
+``freeze: no``.
 
 Templates
 =========
@@ -581,6 +619,15 @@ can do so using the list-of-dictionaries format:
 	    method: merge
 	  - source: B-file.yml
 
+Note that any place a filename can be specified, a shell glob can be used as
+well. So these are also allowed:
+
+.. code-block:: yaml
+
+	include:
+	  - conf.d/*.yml
+	  - conf.d/**/kur_*.yml
+
 Train
 =====
 
@@ -601,8 +648,11 @@ existing model. It looks like this:
 	  # Where the log file lives
 	  log: LOG (optional)
 
-	  # How many epochs to train for (optional)
+	  # DEPRECATED: How many epochs to train for (optional)
 	  epochs: EPOCHS
+
+	  # When to stop training (optional)
+	  stop_when: STOP_WHEN
 
 	  # Where to store weights (optional)
 	  weights: WEIGHTS
@@ -683,13 +733,80 @@ All loggers accept the following arguments:
   disk every batch. If ``rate`` is a positive integer, then batch statistics
   are written out no quicker than once every ``rate`` seconds.
 
+Stop When
+---------
+
+The ``stop_when`` field tells Kur how long it should train for during a ``kur
+train`` run. If it isn't specified (or if it is set to an empty or null value),
+then Kur trains interminably (or rather, until you Ctrl+C the process). It is
+a dictionary which takes the following form:
+
+.. code-block:: yaml
+
+	stop_when:
+	  epochs: EPOCHS
+	  elapsed: ELAPSED
+	  mode: MODE
+
+``EPOCHS`` is the number of epochs to train for. If missing, or if it is set to
+``infinite``, then there is no limit to the number of epochs Kur will train
+for (other stopping criteria still apply, however).
+
+``ELAPSED`` is the amount of time to train for. If missing, or if it is set to
+``infinite``, then there is no limit to the time Kur will spend training the
+model for (other stopping criteria still apply, however). If ``ELAPSED`` is an
+integer, then is specified the number of minutes to train for (as an integer or floating-point number). Alternatively, it can be a dictionary for more fine-grained
+control:
+
+.. code-block:: yaml
+
+	elapsed:
+	  days: DAYS
+	  hours: HOURS
+	  minutes: MINUTES
+	  clock: CLOCK
+
+In this form, the values of ``DAYS``, ``HOURS``, and ``MINUTES`` are added
+together to specify the maximum training time. ``CLOCK`` is optional, and is
+used to select how the time-keeping is done. It can be one of these values:
+
+- ``all``: the total wall-clock time, starting when training starts, and
+  including all time spent saving weights and validating.
+- ``train``: the total time spent training, excluding time spent saving model
+  weights and validating.
+- ``validate``: the total time spent validating.
+- ``batch``: a very strict, fine-grained timer which measures only time spent
+  submitting data to the underlying model during training. This includes only
+  the forward-pass, loss calculation, and backward pass through the model, and
+  does not include, for example, data preparation.
+
+If ``CLOCK`` is not specified, it defaults to ``all``.
+
+If both ``ELAPSED`` and ``EPOCHS`` are specified, then whichever criterion is
+met first will terminate training (logical "OR").
+
+Additionally, ``MODE`` tells Kur how to interpret the stopping criteria, and
+can be one of the following:
+
+- ``additional``. Kur will train for an additional ``EPOCHS`` epochs or
+  ``ELAPSED`` time every time ``kur train`` is called.
+- ``total``. Using the :ref:`log_spec`, Kur will train for exactly ``EPOCHS``
+  epochs total or ``ELAPSED`` time total (whichever comes first), regardless of
+  how many times ``kur train`` is called. For example, let's say that
+  ``EPOCHS`` is 10 in ``total`` mode and ``ELAPSED`` is omitted. You call ``kur
+  train`` but interrupt it after epoch 6 completes. If you can ``kur train``
+  again, it will only train for 4 more epochs (to reach its total of 10). If
+  you call ``kur train`` a third time, it will simply report that has already
+  finished 10 epochs. If a log is not specified, Kur will warn you but proceed
+  training as if ``MODE`` were ``additional``.
+
 Epochs
 ------
 
-The ``epochs`` field is an integer that simply tells Kur how many epochs to
-train for during a ``kur train`` run. If it isn't specified (or if it is set to
-an empty or null value), then Kur trains interminably (or rather, until you
-Ctrl+C the process).
+.. note::
+
+	The ``epochs`` field has been deprecated in favor of the ``stop_when``
+	field, which allows for more flexible stopping criteria.
 
 The ``epochs`` field tells Kur how many epochs to train for during a ``kur
 train`` run. If it isn't specified (or if it is set to an empty or null value),
@@ -745,6 +862,12 @@ Available optimizers:
   parameters:
 
     - ``learning_rate`` (default: 0.001). The learning rate for the optimizer.
+
+- ``adadelta``: The Adadelta optimizer, which takes the following parameters:
+
+	- ``learning_rate`` (default: 1.0). The learning rate for the optimizer.
+	- ``rho`` (default: 0.95)
+	- ``decay`` (default: 0)
 
 - ``sgd``. Stochastic gradient descent. It takes these parameters:
 
@@ -1408,6 +1531,26 @@ Valid suppliers are:
 	At the moment, all CSV data will be cast to floating-point numbers. This
 	means that if strings are encountered, you will get errors.
 
+- ``mind``: This supplier loads data from the Stanford EEG dataset available 
+  generally at https://exhibits.stanford.edu/data/catalog/tc919dd5388. Human 
+  subjects had 129 electrodes mounted to their scalp to read the electric 
+  field produced by their brains while images were displayed to their human 
+  eyeballs. Each subject was shown the same image (chosen from 72 images in 
+  6 categories) twelve times randomly throughout a session. The time series 
+  EEG data has been reduced into 2d FFT PNG images that capture the brain 
+  state of the human subject as s function of time while the image stimulus is 
+  shown to the subject. The reduced dataset used by this supplier is hosted by 
+  Deepgram at http://kur.deepgram.com/data/. Each sample is a 2d FFT image 
+  864x192 pixels in dimension `brain_probe_image` which is a concatenation of 
+  128 smaller 2d FFTs representing the time series state of each electrode 
+  during the time the stimulus is shown. This mega image is coupled with two 
+  labels—a one-hot `category_label` (1 out of 6) of the image being displayed 
+  to the human subjects eyeballs and a one-hot `precise_label` for the 
+  label of the precise image being shown (1 out of 72) to the humans. Either 
+  of these labels can be used as a target for the loss function.The collection 
+  of stimulus images and a statistical analysis of the dataset can be found at 
+  http://journals.plos.org/plosone/article?id=10.1371/journal.pone.0135697.
+
 - ``jsonl``. This supplier loads data from a JSONL file. JSONL files have a
   single JSON blob *per line*, with each line corresponding to another data
   sample. Each JSON blob (i.e., each line) should be a JSON dictionary whose
@@ -1466,6 +1609,9 @@ Valid suppliers are:
 	  the end of the file, as in ``123-``. Percentages are allowed as well by
 	  *appending* a single percent sign to the end of the string, as in:
 	  ``10%``, ``20-30%``, ``90-%``.
+	- ``key``: str or None (default: None). The name of the key in the JSONL
+	  metadata file which contains the ground-truth transcripts. If None,
+	  defaults to "text".
 
   The speech recognition supplier will produce the following data sources that
   you can use in your model:
@@ -1480,7 +1626,8 @@ Valid suppliers are:
   search for a JSON-Lines (JSONL) file, each line of which should be a JSON
   directionary with the following keys:
 
-	- ``text``: the transcription.
+	- ``text``: the transcription (this can be changed using the ``key``
+	  argument to the supplier).
 	- ``duration_s``: the duration of the audio, in seconds.
 	- ``uuid``: a unique value used to identify the audio.
 

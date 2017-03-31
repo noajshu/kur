@@ -352,13 +352,22 @@ class RawTranscript(ChunkSource):
 		self.vocab = self.make_vocab(vocab)
 
 	###########################################################################
+	@staticmethod
+	def make_lower(entry):
+		""" Maps strings or lists of strings to lowercase.
+		"""
+		if isinstance(entry, str):
+			return entry.lower()
+		return [x.lower() for x in entry]
+
+	###########################################################################
 	def make_vocab(self, vocab):
 		""" Loads or infers a vocabulary.
 		"""
 		if vocab is None:
 			logger.info('Inferring vocabulary from data set.')
 			data = set(x for transcript in self.transcripts \
-				for x in transcript.lower())
+				for x in self.make_lower(transcript))
 			data = sorted(data)
 
 		elif isinstance(vocab, str):
@@ -366,7 +375,7 @@ class RawTranscript(ChunkSource):
 			with open(vocab) as fh:
 				json_data = json.loads(fh.read())
 			try:
-				data = [x.lower() for x in json_data]
+				data = [self.make_lower(x) for x in json_data]
 			except:
 				logger.exception('Expected the JSON to contain a single list '
 					'of strings. Instead, we got: %s', json_data)
@@ -375,7 +384,7 @@ class RawTranscript(ChunkSource):
 		elif isinstance(vocab, (tuple, list)):
 			logger.info('Using a hard-coded vocabulary.')
 			try:
-				data = [x.lower() for x in vocab]
+				data = [self.make_lower(x) for x in vocab]
 			except:
 				logger.exception('Expected the vocabulary to be a list of '
 					'strings. Instead, we got: %s', vocab)
@@ -478,8 +487,8 @@ class SpeechRecognitionSupplier(Supplier):
 	###########################################################################
 	def __init__(self, url=None, path=None, checksum=None, unpack=None, 
 		type=None, normalization=None, min_duration=None, max_duration=None,
-		max_frequency=None, vocab=None, samples=None, fill=None, *args,
-		**kwargs):
+		max_frequency=None, vocab=None, samples=None, fill=None, key=None,
+		*args, **kwargs):
 		""" Creates a new speech recognition supplier.
 
 			# Arguments
@@ -489,7 +498,7 @@ class SpeechRecognitionSupplier(Supplier):
 		if unpack is None:
 			unpack = SpeechRecognitionSupplier.DEFAULT_UNPACK
 		self.load_data(url=url, path=path, checksum=checksum, unpack=unpack,
-			min_duration=min_duration, max_duration=max_duration)
+			min_duration=min_duration, max_duration=max_duration, text_key=key)
 		self.downselect(samples)
 
 		logger.debug('Creating sources.')
@@ -626,7 +635,7 @@ class SpeechRecognitionSupplier(Supplier):
 
 	###########################################################################
 	def load_data(self, url=None, path=None, checksum=None, unpack=None,
-		min_duration=None, max_duration=None):
+		min_duration=None, max_duration=None, text_key=None):
 		""" Loads the data for this supplier.
 		"""
 		local_path, is_packed = package.install(
@@ -655,17 +664,20 @@ class SpeechRecognitionSupplier(Supplier):
 			manifest=manifest,
 			root=local_path,
 			min_duration=min_duration,
-			max_duration=max_duration
+			max_duration=max_duration,
+			text_key=text_key
 		)
 
 	###########################################################################
-	def get_metadata(self, manifest=None, root=None, 
-		min_duration=None, max_duration=None):
+	def get_metadata(self, manifest=None, root=None, min_duration=None,
+		max_duration=None, text_key=None):
 		""" Scans the package for a metadata file, makes sure everything is in
 			order, and returns some information about the data set.
 		"""
 		logger.debug('Looking for metadata file.')
 		metadata_file = None
+
+		text_key = text_key or 'text'
 
 		def look_in_list(filenames):
 			""" Searches a list of files for a JSONL file.
@@ -714,6 +726,7 @@ class SpeechRecognitionSupplier(Supplier):
 		}
 
 		entries = 0
+		required_keys = (text_key, 'duration_s', 'uuid')
 		with open(metadata_file, 'r') as fh:
 			for line_number, line in enumerate(fh, 1):
 				try:
@@ -722,7 +735,7 @@ class SpeechRecognitionSupplier(Supplier):
 					logger.warning('Failed to parse valid JSON on line %d of '
 						'file %s', line_number, metadata_file)
 					continue
-				if any(k not in entry for k in ('text', 'duration_s', 'uuid')):
+				if any(k not in entry for k in required_keys):
 					logger.warning('Line %d is missing one of its required '
 						'keys in metadata file %s', line_number, metadata_file)
 					continue
@@ -734,7 +747,7 @@ class SpeechRecognitionSupplier(Supplier):
 					continue
 
 				data['duration'][entries] = entry['duration_s']
-				data['transcript'][entries] = entry['text']
+				data['transcript'][entries] = entry[text_key]
 				data['audio'][entries] = os.path.join(source, entry['uuid'])
 
 				entries += 1

@@ -14,11 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import sys
 import os
 import copy
 import socket
 import warnings
 import logging
+import glob
 from collections import deque
 
 from .engine import ScopeStack, PassthroughEngine
@@ -75,6 +77,7 @@ class Kurfile:
 		self.model = None
 		self.backend = None
 		self.engine = engine
+		self.templates = None
 
 	###########################################################################
 	def parse(self):
@@ -110,7 +113,8 @@ class Kurfile:
 
 		# Parse the settings (backends, globals, hyperparameters, ...)
 		self._parse_section(
-			self.engine, builtin['settings'], stack, include_key=False)
+			self.engine, builtin['settings'], stack, include_key=False,
+			auto_scope=True)
 
 		# Parse all of the "action" sections.
 		self._parse_section(
@@ -262,6 +266,19 @@ class Kurfile:
 			log = None
 
 		epochs = self.data['train'].get('epochs')
+		stop_when = self.data['train'].get('stop_when', {})
+		if epochs:
+			if stop_when:
+				warnings.warn('"stop_when" has replaced "epochs" in the '
+					'"train" section. We will try to merge things together, '
+					'giving "stop_when" priority.', DeprecationWarning)
+			if isinstance(epochs, dict):
+				if 'number' in epochs and 'epochs' not in stop_when:
+					stop_when['epochs'] = epochs['number']
+				if 'mode' in epochs and 'mode' not in stop_when:
+					stop_when['mode'] = epochs['mode']
+			elif 'epochs' not in stop_when:
+				stop_when['epochs'] = epochs
 
 		provider = self.get_provider('train')
 
@@ -365,7 +382,7 @@ class Kurfile:
 			defaults = {
 				'provider' : provider,
 				'validation' : validation,
-				'epochs' : epochs,
+				'stop_when' : stop_when,
 				'log' : log,
 				'best_train' : best_train,
 				'best_valid' : best_valid,
@@ -645,8 +662,8 @@ class Kurfile:
 				break
 		else:
 			if required:
-				raise ValueError(
-					'Missing required section: {}'.format(', '.join(section)))
+				raise ValueError('Missing required section: {}'
+					.format(', '.join(section)))
 			else:
 				return None
 
@@ -705,7 +722,7 @@ class Kurfile:
 				'Expected each "include" to be a string or a dictionary. '
 				'Received: {}'.format(context or 'top-level', source))
 
-		logger.info('Parsing source: %s, included by %s.', source,
+		logger.info('Parsing source: %s, included by %s.', filename,
 			context or 'top-level')
 
 		if context:
@@ -743,19 +760,54 @@ class Kurfile:
 				'files. Instead we received: {}'.format(
 					expanded, new_sources))
 
-		for x in new_sources:
-			data = mergetools.deep_merge(
+		def load_source(source):
+			return mergetools.deep_merge(
 				self.parse_source(
 					engine,
-					source=x,
+					source=source,
 					context=expanded,
 					loaded=loaded
 				),
 				data,
 				strategy=strategy
 			)
+		for new_source in new_sources:
+			if isinstance(new_source, dict) and 'source' in new_source:
+				sub_sources = new_source.pop('source')
+				if not isinstance(sub_sources, (list, tuple)):
+					sub_sources = [sub_sources]
+				for sub_source in sub_sources:
+					for x in self.glob(sub_source, source=expanded,
+						recursive=True
+					):
+						new_source['source'] = x
+						data = load_source(dict(new_source))
+			elif isinstance(new_source, str):
+				for x in self.glob(new_source, source=expanded,
+					recursive=True
+				):
+					data = load_source(x)
+			else:
+				data = load_source(new_source)
 
 		return data
+
+	###########################################################################
+	@staticmethod
+	def glob(path, *, source=None, recursive=False):
+		""" Wrapper for Python's `glob`.
+		"""
+		if sys.version_info < (3, 5):
+			kwargs = {}
+			if recursive and '**' in path:
+				warnings.warn('Recursive globbing is not supported on Python '
+					'3.4. Ignoring this...', UserWarning)
+		else:
+			kwargs = {'recursive' : recursive}
+
+		if source:
+			path = os.path.join(os.path.dirname(source), path)
+		yield from glob.iglob(path, **kwargs)
 
 	###########################################################################
 	def _parse_templates(self, engine, section, stack):
@@ -790,7 +842,7 @@ class Kurfile:
 
 	###########################################################################
 	def _parse_section(self, engine, section, stack, *,
-		required=False, include_key=True):
+		required=False, include_key=True, auto_scope=False):
 		""" Parses a single top-level entry in the Kurfile.
 
 			# Arguments
@@ -835,7 +887,11 @@ class Kurfile:
 			else:
 				return None
 
-		with ScopeStack(engine, stack + [{key : self.data[key]}]):
+		extra_stack = [{key : self.data[key]}]
+		if auto_scope:
+			extra_stack += [self.data[key]] \
+				if isinstance(self.data[key], dict) else []
+		with ScopeStack(engine, stack + extra_stack):
 			evaluated = engine.evaluate(self.data[key], recursive=True)
 
 		if not include_key:

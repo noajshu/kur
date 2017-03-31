@@ -208,6 +208,58 @@ following:
 
 	sudo apt-get install python3-dev
 
+TypeError: Expected int32, got list containing Tensors of type '_Message' instead.
+----------------------------------------------------------------------------------
+
+If you are using TensorFlow <= 0.12 (see ``pip freeze``), upgrade to TensorFlow >= 1.0::
+
+	pip install --upgrade tensorflow      # And/or tensorflow-gpu
+
+You forced the use of gpu device 'gpu', but nvcc was not found.
+---------------------------------------------------------------
+
+If you don't have a GPU, then remove the `device: gpu` line from your Kurfile.
+If you **do** have a GPU, read on.
+
+First, do you actually have CUDA installed? If not, make sure you have the
+`latest NVIDIA drivers <https://www.nvidia.com/Download/index.aspx>`_ for your
+GPU, and then `install CUDA <https://developer.nvidia.com/cuda-downloads>`_.
+
+Next, we need to get ``nvcc`` on your PATH. It's probably in
+``/usr/local/cuda/bin``, but you can also directly search for it:
+
+.. code-block:: bash
+
+	sudo find / -name nvcc -type f 2>/dev/null
+
+Finally, we need to update your PATH. Depending on your platform and shell, the
+command may look like:
+
+.. code-block:: bash
+
+	echo 'export PATH=/usr/local/cuda/bin:$PATH' >> ~/.bashrc
+
+Now, either close your terminal and then bring it back up, or just activate the
+new PATH using:
+
+.. code-block:: bash
+
+	source ~/.bashrc
+
+ValueError: Invalid value ("true") for configuration variable "dnn.enabled"
+---------------------------------------------------------------------------
+
+Theano has changed the format for its configuration file, which by default is
+at ``~/.theanorc``. Change lines like this::
+
+	[dnn]
+	enabled = true
+
+to this::
+
+	[dnn]
+	enabled = True
+
 Plotting
 ========
 
