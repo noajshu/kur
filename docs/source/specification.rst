@@ -87,6 +87,7 @@ container looks like this:
 	  inputs: INPUTS
 	  sink: SINK
 	  freeze: FREEZE
+	  when: WHEN
 
 There are many different kinds of containers, which we describe on the
 :doc:`containers` page. The parameters that are given to the container (e.g.,
@@ -356,6 +357,14 @@ allowing its parameters to vary during training. If the ``for`` loop did *not*
 have a ``freeze`` value specified, then all three ``dense`` layers would be
 trainable (not frozen), because they would inherit the global default of
 ``freeze: no``.
+
+When
+----
+
+``when`` allows for conditional layers. When the layer is parsed, the value of
+``when`` is evaluated. If it evaluates to---or can be cast to---a boolean True,
+then the container is kept; otherwise, that container is skipped. If ``when``
+is not specified, it defaults to True.
 
 Templates
 =========
@@ -1612,6 +1621,15 @@ Valid suppliers are:
 	- ``key``: str or None (default: None). The name of the key in the JSONL
 	  metadata file which contains the ground-truth transcripts. If None,
 	  defaults to "text".
+	- ``bucket``: float or None (default: None). If not None, then the number
+	  of frames of audio in each batch are rounded up to the nearest multiple
+	  of ``bucket`` seconds. Otherwise, no additional rounding/padding is
+	  applied. The number of frames of required audio are derived from the
+	  bucket time (in seconds) by assuming that each audio frame has duration
+	  10ms.
+	- ``data_cpus``: integer or None (default: None). The number of CPUs to use
+	  during audio processing. If None, it will use N-1 cores, where N is the
+	  number of cores available.
 
   The speech recognition supplier will produce the following data sources that
   you can use in your model:
@@ -1646,10 +1664,47 @@ Similarly, if you create a Python pickle, then the keys in the pickled
 dictionary must correspond to the names of the input and output containers in
 the model.
 
+Multi-Validation
+^^^^^^^^^^^^^^^^
+
+Imagine that you want to train on a given data set, but want to understand how
+validation loss varies across multiple, independent data sets. In this case,
+you can pass a dictionary to ``validate`` and ``test``:
+
+.. code-block:: yaml
+
+	validate: # or test
+	  data:
+	    DATASET_1:
+	      - SUPPLIER_1:
+	         # ...
+	      - SUPPLIER_2:
+	         # ...
+	      # ...
+	    DATASET_2:
+	      # ...
+
+You can call ``DATASET_`` anything you want. These are simply labels for each
+validation/testing set you want. Note that you *do not* need to use this syntax
+if you want to use traditional, single-validation paradigm; this is simply an
+additional syntax that Kur supports. You can still "stack" multiple data
+suppliers into each `DATASET_`.  .. _package_specification:
+
+All validation statistics will be saved separately for each `DATASET_` entry.
+Kur also calculates an average/global/overall loss as well (as if you had
+combined all validation sets). All plots (as from the plot hook) will include
+all validation datasets.
+
+The same `provider` is used for all multi-validation datasets. No need to
+defined multiple `provider` blocks. So if you use `provider: {num_batches:
+10}`, you will get 10 batches from *each* validation dataset. If you use
+`train: {checkpoint: {validation: 10}}`, then you will get 10 batches from
+*each* validation dataset during checkpointing.
+
 .. _package_specification:
 
 Standard Packaging
-``````````````````
+^^^^^^^^^^^^^^^^^^
 
 Many of the data suppliers accept a standard set of parameters to make things
 convenient for you. These parameters are: ``url``, ``checksum``, and ``path``,
@@ -1727,6 +1782,8 @@ given to the provider as parameters. Valid provider names are:
 	  its best to use fixed-sized batches, but may occassionally return smaller
 	  batches (particularly at the end of the epoch if the length of the
 	  training set is not evenly divisible by the batch size).
+	- ``reverse``: A boolean indicating whether or not the sorting (if any)
+	  should be reversed.
 
 If the ``provider`` section is not given, or if ``name`` is not specified, then
 a ``batch_provider`` is created as a default provider.

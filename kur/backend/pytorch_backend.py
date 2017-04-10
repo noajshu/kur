@@ -50,6 +50,20 @@ class PyTorchBackend(Backend):
 		return 'pytorch'
 
 	###########################################################################
+	@property
+	def version(self):
+		""" Returns the PyTorch version, as a tuple of (MAJOR, MINOR, PATCH).
+		"""
+		import torch							# pylint: disable=import-error
+		version = torch.__version__
+		match = re.match(r'([0-9]+)\.([0-9]+)\.([0-9]+)\.*', version)
+		if not match:
+			logger.warning('Unable to infer PyTorch version. We '
+				'cannot check for version incompatibilities.')
+			return (0, 0, 0)
+		return tuple(int(x) for x in match.groups())
+
+	###########################################################################
 	def save(self, model, filename):
 		""" Saves the model weights to the given filename.
 
@@ -193,7 +207,13 @@ class PyTorchBackend(Backend):
 			assembly.
 		"""
 		from .pytorch.modules import TorchModel
-		data = TorchModel(gpu=self.devices)
+		if self.parallel:
+			os.environ['CUDA_VISIBLE_DEVICES'] = \
+				','.join(str(x) for x in self.devices)
+			devices = tuple(range(self.parallel))
+		else:
+			devices = None
+		data = TorchModel(gpu=devices)
 		data.allow_reuse = True
 		return data
 
@@ -331,10 +351,23 @@ class PyTorchBackend(Backend):
 				torch_optimizer = optimizer.get_optimizer(self)(
 					trainables)
 
+			if optimizer.clip_type:
+				if self.version < (0, 1, 10):
+					# Of course, we could always clip the gradients ourselves,
+					# but let's just rely on PyTorch for that.
+					logger.warning('Gradient clipping is only supported on '
+						'PyTorch versions >= 0.1.10. We will ignore the '
+						'optimizer\'s "clip" setting.')
+					optimizer.clip_type = None
+
 			torch_losses = self.process_loss(model, loss)
 
 			key = 'train'
-			result = {'loss' : torch_losses, 'optimizer' : torch_optimizer}
+			result = {
+				'loss' : torch_losses,
+				'optimizer' : torch_optimizer,
+				'kur_optimizer' : optimizer
+			}
 
 		result.update({
 			'model' : model.data
@@ -376,7 +409,7 @@ class PyTorchBackend(Backend):
 		with DisableLogging():
 			provider = BatchProvider(
 				sources=dict(zip(model.provider.keys, model.provider.sources)),
-				batch_size=2*min(1, self.parallel),
+				batch_size=2*max(1, self.parallel),
 				num_batches=1,
 				randomize=False
 			)
@@ -385,6 +418,7 @@ class PyTorchBackend(Backend):
 		logger.info('Waiting for model to be ready to use...')
 		for batch in provider:
 			model.data.predict(batch)
+		logger.info('Model is ready for use.')
 
 	###########################################################################
 	def summary(self, model, file=None):
@@ -431,6 +465,7 @@ class PyTorchBackend(Backend):
 		torch_model = model.compiled['train']['model']
 		losses = model.compiled['train']['loss']
 		optimizer = model.compiled['train']['optimizer']
+		kur_optimizer = model.compiled['train']['kur_optimizer']
 
 		if optimizer:
 			optimizer.zero_grad()
@@ -439,6 +474,13 @@ class PyTorchBackend(Backend):
 
 		if optimizer:
 			torch_model.backprop(losses)
+
+			if kur_optimizer.clip_type:
+				torch_model.clip_gradients(
+					kur_optimizer.clip_type,
+					kur_optimizer.clip_value
+				)
+
 			optimizer.step()
 
 		metrics = {

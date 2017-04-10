@@ -95,6 +95,13 @@ class TorchModel:
 		it.
 	"""
 
+	DATA_CAST = {
+		'int' : lambda x: x.int(),
+		'long' : lambda x: x.long(),
+		'float' : lambda x: x.float(),
+		'double' : lambda x: x.double()
+	}
+
 	###########################################################################
 	def __init__(self, gpu=None):
 		""" Creates a new model.
@@ -106,6 +113,7 @@ class TorchModel:
 		self.gpu = gpu
 		self._reuse = False
 		self.final_model = None
+		self.info = []
 
 	###########################################################################
 	@property
@@ -152,7 +160,7 @@ class TorchModel:
 		return nn.DataParallel(self.model, devices).cuda()
 
 	###########################################################################
-	def to_torch(self, tensor):
+	def to_torch(self, tensor, *, location=None, data_type=None):
 		""" Creates a Torch tensor from an array.
 
 			# Arguments
@@ -169,9 +177,10 @@ class TorchModel:
 			tensor = numpy.array(tensor)
 		if isinstance(tensor, numpy.ndarray):
 			tensor = torch.from_numpy(tensor)
-		tensor = tensor.float()
+		tensor = self.DATA_CAST.get(data_type or 'float')(tensor)
 		if self.gpu:
-			tensor = tensor.cuda()
+			if location != 'cpu':
+				tensor = tensor.cuda()
 		return tensor
 
 	###########################################################################
@@ -179,8 +188,10 @@ class TorchModel:
 		""" Performs the forward pass.
 		"""
 		inputs = tuple(
-			Variable(self.to_torch(data[k]))
-			for k in self.inputs
+			Variable(self.to_torch(
+				data[k], location=info['location'], data_type=info['type']
+			))
+			for k, info in zip(self.inputs, self.info)
 		)
 		return self.final_model(*inputs)
 
@@ -209,8 +220,10 @@ class TorchModel:
 				output to compare against.
 		"""
 		inputs = tuple(
-			Variable(self.to_torch(data[k]))
-			for k in self.inputs
+			Variable(self.to_torch(
+				data[k], location=info['location'], data_type=info['type']
+			))
+			for k, info in zip(self.inputs, self.info)
 		)
 		predictions = self.final_model(*inputs)
 
@@ -237,7 +250,7 @@ class TorchModel:
 		return module
 
 	###########################################################################
-	def placeholder(self, name, create=True):
+	def placeholder(self, name, *, create=True, location=None, data_type=None):
 		""" Creates a new input placeholder, or retrieves an existing one.
 		"""
 
@@ -249,6 +262,10 @@ class TorchModel:
 				return None
 			index = len(self.inputs)
 			self.inputs.append(name)
+			self.info.append({
+				'location' : location,
+				'type' : data_type
+			})
 
 		#######################################################################
 		def calculate(_, *inputs):
@@ -286,6 +303,21 @@ class TorchModel:
 		torch.autograd.backward(
 			losses,
 			grads
+		)
+
+	###########################################################################
+	def clip_gradients(self, clip_type, clip_value):
+		if clip_type == 'norm':
+			norm_type = 2
+		elif clip_type == 'abs':
+			norm_type = 'inf'
+		else:
+			raise ValueError('Clip type must be "norm" or "abs".')
+
+		nn.utils.clip_grad_norm(
+			self.get_trainable_parameters(),
+			clip_value,
+			norm_type
 		)
 
 	###########################################################################
@@ -384,11 +416,24 @@ def bundle(*x):
 	return x
 
 ###############################################################################
-def swap_channels(x):
+def move_channel_forward(x):
+	ndim = x.dim()
+	permutation = (0, ndim-1) + tuple(range(1, ndim-1))
+	return x.permute(*permutation)
+
+###############################################################################
+def move_channel_backward(x):
+	ndim = x.dim()
+	permutation = (0, ) + tuple(range(2, ndim)) + (1, )
+	return x.permute(*permutation)
+
+###############################################################################
+class swap_channels:
 	""" Swaps the dimensions between Theano/PyTorch and TensorFlow dimension
 		orderings.
 	"""
-	return torch.transpose(x, 1, x.dim()-1)
+	begin = move_channel_forward
+	end = move_channel_backward
 
 ###############################################################################
 def parallel(layer):

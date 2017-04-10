@@ -21,6 +21,9 @@ import logging
 import random
 
 import numpy
+import multiprocessing
+
+from multiprocessing import Pool
 
 from ..sources import DerivedSource, VanillaSource, ChunkSource
 from . import Supplier
@@ -30,6 +33,29 @@ from ..utils import get_audio_features
 from ..utils import Normalize
 
 logger = logging.getLogger(__name__)
+
+###############################################################################
+def _init_data_worker():
+	import signal
+	signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+###############################################################################
+def _load_single(args):
+	"""
+	This function is called through an instance of multiprocessing.Pool 
+	in the RawUtterance source.  We do not make this function an instance
+	method of RawUtterance in order to avoid unnecessary pickling of 
+	RawUtterance instances which would fail due to the presence of some
+	unpickleable instance variables.
+	"""
+	(feature_type, high_freq, on_error), paths = args
+	result = [None] * len(paths)
+	for i, path in enumerate(paths):
+		result[i] = get_audio_features(path, feature_type=feature_type, high_freq=high_freq, on_error=on_error)
+		if result[i] is None:
+			logger.error('Failed to load audio file at path: %s', path)
+	return result
+
 
 ###############################################################################
 def loop_copy(src, dest):
@@ -89,16 +115,30 @@ class Utterance(DerivedSource):
 		ensures that all data products are rectangular tensors (rather than
 		ragged arrays).
 	"""
-	def __init__(self, source, raw, fill=None):
+	def __init__(self, source, raw, fill=None, bucket=None):
 		super().__init__()
 		self.source = source
 		self.raw = raw
+
 		self.fill = fill or 'zero'
 		assert isinstance(self.fill, str) and self.fill in ('zero', 'loop')
 		logger.debug('Utterance source is using fill mode "%s".', self.fill)
+
+		if bucket:
+			if not isinstance(bucket, (float, int)) or bucket <= 0:
+				raise ValueError('"bucket" must be a positive number.')
+			logger.debug('Utterance source is using bucket: %.3f sec', bucket)
+			# 10ms audio frames mean there are 100 frames per second.
+			# So convert seconds to frames.
+			bucket = round(bucket * 100)
+			logger.debug('This bucket is equivalent to: %d frames', bucket)
+		self.bucket = bucket
+
 	def derive(self, inputs):
 		utterances, = inputs
 		max_len = max(len(x) for x in utterances)
+		if self.bucket:
+			max_len = (max_len-1) - ((max_len-1) % self.bucket) + self.bucket
 
 		if self.fill == 'zero':
 			output = numpy.zeros(
@@ -138,7 +178,7 @@ class RawUtterance(ChunkSource):
 
 	###########################################################################
 	def __init__(self, audio_paths, feature_type=None,
-		normalization=None, max_frequency=None, *args, **kwargs):
+		normalization=None, max_frequency=None, data_cpus=1, *args, **kwargs):
 		""" Creates a new raw utterance source.
 		"""
 
@@ -148,6 +188,10 @@ class RawUtterance(ChunkSource):
 		self.feature_type = feature_type
 		self.features = None
 		self.max_frequency = max_frequency
+
+		assert isinstance(data_cpus, int)
+		self.data_cpus = max(1, data_cpus)
+		self.pool = Pool(data_cpus, _init_data_worker)
 
 		self._init_normalizer(normalization)
 
@@ -205,25 +249,43 @@ class RawUtterance(ChunkSource):
 		self.norm = norm
 
 	###########################################################################
-	def load_audio(self, paths):
+	def load_audio(self, partial_paths):
 		""" Loads unnormalized audio data.
 		"""
-		# Resolve and load each path.
-		result = [None] * len(paths)
-		for i, partial_path in enumerate(paths):
-			path = SpeechRecognitionSupplier.find_audio_path(partial_path)
+
+		# Resolve each path.
+		paths = [
+			SpeechRecognitionSupplier.find_audio_path(partial_path)
+			for partial_path in partial_paths
+		]
+
+		for path, partial_path in zip(paths, partial_paths):
 			if path is None:
 				logger.error('Could not find audio file that---ignoring '
-					'extension---begins with: %s', partial_path)
-			else:
-				result[i] = get_audio_features(
-					path,
-					feature_type=self.feature_type,
-					high_freq=self.max_frequency,
-					on_error='suppress'
-				)
-				if result[i] is None:
-					logger.error('Failed to load audio file at path: %s', path)
+						'extension---begins with: %s', partial_path)
+		paths = [path for path in paths if path]
+
+		n_paths = len(paths)
+		n_cpus = min(n_paths, self.data_cpus)
+		n = n_paths // n_cpus  # paths per cpu
+		args = (self.feature_type, self.max_frequency, 'suppress')  # arguments to be passed into worker function
+
+		# Split the paths to be processed as evenly as possible 
+		x = [(args, paths[i * n:(i+1) * n]) for i in range(n_cpus - 1)]
+
+		# In case n_paths is not evenly divisible by n_cpus, we handle the last
+		# element outside of the above list comprehension
+		x.append((args, paths[(n_cpus - 1) * n:])) 
+	
+		# actually load audio via process pool
+		try:
+			result = self.pool.map(_load_single, x)
+		except KeyboardInterrupt:
+			self.pool.terminate()
+			self.pool.join()
+
+		# flatten the result, which is a list of lists
+		result  =  [x for y in result for x in y]
 
 		# Clean up bad audio
 		if any(x is None for x in result):
@@ -488,7 +550,7 @@ class SpeechRecognitionSupplier(Supplier):
 	def __init__(self, url=None, path=None, checksum=None, unpack=None, 
 		type=None, normalization=None, min_duration=None, max_duration=None,
 		max_frequency=None, vocab=None, samples=None, fill=None, key=None,
-		*args, **kwargs):
+		bucket=None, data_cpus=None, *args, **kwargs):
 		""" Creates a new speech recognition supplier.
 
 			# Arguments
@@ -502,11 +564,13 @@ class SpeechRecognitionSupplier(Supplier):
 		self.downselect(samples)
 
 		logger.debug('Creating sources.')
+		data_cpus = max(1, multiprocessing.cpu_count() - 1 if not data_cpus else data_cpus)
 		utterance_raw = RawUtterance(
 			self.data['audio'],
 			feature_type=type or SpeechRecognitionSupplier.DEFAULT_TYPE,
 			normalization=normalization,
-			max_frequency=max_frequency
+			max_frequency=max_frequency,
+			data_cpus=data_cpus
 		)
 		self.sources = {
 			'transcript_raw' : RawTranscript(
@@ -517,7 +581,12 @@ class SpeechRecognitionSupplier(Supplier):
 			'transcript' : Transcript('transcript_raw'),
 			'utterance_raw' : utterance_raw,
 			'utterance_length' : UtteranceLength('utterance_raw'),
-			'utterance' : Utterance('utterance_raw', utterance_raw, fill=fill),
+			'utterance' : Utterance(
+				'utterance_raw',
+				utterance_raw,
+				fill=fill,
+				bucket=bucket
+			),
 			'duration' : VanillaSource(numpy.array(self.data['duration'])),
 			'audio_source' : VanillaSource(numpy.array(self.data['audio']))
 		}

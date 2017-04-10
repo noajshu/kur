@@ -18,6 +18,7 @@ import os
 import ast
 import jinja2
 from .engine import Engine
+from ..utils import CudaContext, CudaError
 
 ###############################################################################
 def combine(value, new=None):
@@ -33,6 +34,33 @@ def as_dict(value, key):
 	""" Jinja2 filter which constructs a dictionary from a key/value pair.
 	"""
 	return {key : value}
+
+###############################################################################
+def ternary(value, result_true, result_false):
+	""" Implements a ternary if/else conditional.
+	"""
+	return result_true if value else result_false
+
+###############################################################################
+# pylint: disable=protected-access
+def gpu_count():
+	""" Returns the number of GPU devices available on the system.
+
+		Notes
+		-----
+
+		The result of this function is cached so that it will return
+		immediately during future calls.
+	"""
+	if gpu_count._value is None:
+		try:
+			with CudaContext() as context:
+				gpu_count._value = len(context)
+		except CudaError:
+			gpu_count._value = 0
+	return gpu_count._value
+gpu_count._value = None
+# pylint: enable=protected-access
 
 ###############################################################################
 class JinjaEngine(Engine):
@@ -55,6 +83,9 @@ class JinjaEngine(Engine):
 		env.filters['splitext'] = os.path.splitext
 		env.filters['combine'] = combine
 		env.filters['as_dict'] = as_dict
+		env.filters['ternary'] = ternary
+
+		env.globals['gpu_count'] = gpu_count
 
 	###########################################################################
 	def __init__(self, *args, **kwargs):
